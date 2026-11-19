@@ -2,6 +2,7 @@ package main
 
 import (
 	"audializer/def"
+	"context"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -10,7 +11,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"gopkg.in/vansante/go-ffprobe.v2"
 	"gopkg.in/yaml.v3"
 )
 
@@ -23,19 +26,23 @@ func main() {
 		log.Fatalf("Cannot open config file: %v", err)
 	}
 	var config def.Config
-	yaml.Unmarshal(configFile, config)
+	if err := yaml.Unmarshal(configFile, &config); err != nil {
+		log.Fatalf("Cannot read config file: %v", err)
+	}
 
 	var dirCreateFunc fs.WalkDirFunc = func(path string, entry fs.DirEntry, err error) error {
 		if !entry.IsDir() {
 			return nil
 		}
-		split := filepath.SplitList(path)
+		split := strings.Split(path, string(filepath.Separator))
 		if len(split) < 2 {
 			return nil
 		}
 		newPathParts := append([]string{config.OutputFolder}, split[1:]...)
 		newPath := filepath.Join(newPathParts...)
-		os.MkdirAll(newPath, 0775)
+		if err := os.MkdirAll(newPath, 0775); err != nil {
+			return fmt.Errorf("Cannot create new path: %v", err)
+		}
 		return nil
 	}
 
@@ -46,29 +53,56 @@ func main() {
 
 		filename := entry.Name()
 		ext := filepath.Ext(filename)
-		name, _ := strings.CutSuffix(filename, "."+ext)
+		name, _ := strings.CutSuffix(filename, ext)
 
 		if !def.ALLOWED_MIMETYPES[ext] {
 			return nil
 		}
 
 		outputFilename := fmt.Sprintf("%s.mp3", name)
+
 		outputFile := filepath.Join(config.OutputFolder, outputFilename)
+		split := strings.Split(path, string(filepath.Separator))
+		if len(split) > 1 {
+			newFilenameParts := append(split[:len(split)-1], outputFilename)
+
+			newPathParts := append([]string{config.OutputFolder}, newFilenameParts[1:]...)
+			outputFile = filepath.Join(newPathParts...)
+		}
 
 		// check if file already exists by seeing if a stat succeeds
 		if _, err := os.Stat(outputFile); err == nil {
 			return nil
 		}
 
+		stream, err := getAudioStream(path)
+		if err != nil {
+			log.Fatalf("Cannot get audio stream from file: %v", err)
+		}
+
 		args := []string{
-			"-i",
-			filename,
+			// "-hide_banner",
+			// "-loglevel", "error",
+			"-i", path,
+			"-vn",
+			"-map", fmt.Sprintf("0:%d", stream),
+			"-c:a", "libmp3lame",
 			"-q:a", "0",
-			"-map", "a",
+			"-f", "mp3",
 			outputFile,
 		}
 
-		exec.Command("ffmpeg", args...)
+		cmd := exec.Command("ffmpeg", args...)
+
+		cmd.Stdout = os.Stderr
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Run(); err != nil {
+			if err := os.Remove(outputFile); err != nil {
+				log.Default().Printf("Cannot delete failed file %s\n", outputFile)
+			}
+			return fmt.Errorf("Transcode for %s failed: %v", path, err)
+		}
 
 		return nil
 	}
@@ -83,4 +117,32 @@ func main() {
 			log.Fatalf("Error while transcoding files: %v", err)
 		}
 	}
+}
+
+func getAudioStream(path string) (int, error) {
+	ctx, cancelFn := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelFn()
+
+	fileReader, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("Error opening test file: %v", err)
+	}
+
+	data, err := ffprobe.ProbeReader(ctx, fileReader)
+	if err != nil {
+		return 0, fmt.Errorf("Error getting data: %v", err)
+	}
+	audio := data.StreamType(ffprobe.StreamAudio)
+	if len(audio) == 0 {
+		return 0, fmt.Errorf("no audio streams in %s", path)
+	}
+
+	pick := audio[0]
+	for _, s := range audio {
+		if s.TagList["Language"] == "eng" {
+			pick = s
+			break
+		}
+	}
+	return pick.Index, nil
 }
