@@ -1,7 +1,11 @@
 package def
 
 type Config struct {
-	Folders      []string `yaml:"Folders"`
-	Workers      int      `yaml:"Workers"`
-	OutputFolder string   `yaml:"OutputFolder"`
+	Folders []FolderPair `yaml:"Folders"`
+	Workers int          `yaml:"Workers"`
+}
+
+type FolderPair struct {
+	Source      string `yaml:"Source"`
+	Destination string `yaml:"Destination"`
 }

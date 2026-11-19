@@ -30,89 +30,85 @@ func main() {
 		log.Fatalf("Cannot read config file: %v", err)
 	}
 
-	var dirCreateFunc fs.WalkDirFunc = func(path string, entry fs.DirEntry, err error) error {
-		if !entry.IsDir() {
-			return nil
-		}
-		split := strings.Split(path, string(filepath.Separator))
-		if len(split) < 2 {
-			return nil
-		}
-		newPathParts := append([]string{config.OutputFolder}, split[1:]...)
-		newPath := filepath.Join(newPathParts...)
-		if err := os.MkdirAll(newPath, 0775); err != nil {
-			return fmt.Errorf("Cannot create new path: %v", err)
-		}
-		return nil
-	}
-
-	var walkFunc fs.WalkDirFunc = func(path string, entry fs.DirEntry, err error) error {
-		if entry.IsDir() {
-			return nil
-		}
-
-		filename := entry.Name()
-		ext := filepath.Ext(filename)
-		name, _ := strings.CutSuffix(filename, ext)
-
-		if !def.ALLOWED_MIMETYPES[ext] {
-			return nil
-		}
-
-		outputFilename := fmt.Sprintf("%s.mp3", name)
-
-		outputFile := filepath.Join(config.OutputFolder, outputFilename)
-		split := strings.Split(path, string(filepath.Separator))
-		if len(split) > 1 {
-			newFilenameParts := append(split[:len(split)-1], outputFilename)
-
-			newPathParts := append([]string{config.OutputFolder}, newFilenameParts[1:]...)
-			outputFile = filepath.Join(newPathParts...)
-		}
-
-		// check if file already exists by seeing if a stat succeeds
-		if _, err := os.Stat(outputFile); err == nil {
-			return nil
-		}
-
-		stream, err := getAudioStream(path)
-		if err != nil {
-			log.Fatalf("Cannot get audio stream from file: %v", err)
-		}
-
-		args := []string{
-			// "-hide_banner",
-			// "-loglevel", "error",
-			"-i", path,
-			"-vn",
-			"-map", fmt.Sprintf("0:%d", stream),
-			"-c:a", "libmp3lame",
-			"-q:a", "0",
-			"-f", "mp3",
-			outputFile,
-		}
-
-		cmd := exec.Command("ffmpeg", args...)
-
-		cmd.Stdout = os.Stderr
-		cmd.Stderr = os.Stderr
-
-		if err := cmd.Run(); err != nil {
-			if err := os.Remove(outputFile); err != nil {
-				log.Default().Printf("Cannot delete failed file %s\n", outputFile)
-			}
-			return fmt.Errorf("Transcode for %s failed: %v", path, err)
-		}
-
-		return nil
-	}
-
 	for _, folder := range config.Folders {
-		err := filepath.WalkDir(folder, dirCreateFunc)
+		destRoot := folder.Destination
+
+		err := filepath.WalkDir(folder.Source, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !entry.IsDir() {
+				return nil
+			}
+			rel, err := filepath.Rel(folder.Source, path)
+			if err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Join(destRoot, rel), 0775); err != nil {
+				return fmt.Errorf("Cannot create new path: %v", err)
+			}
+			return nil
+		})
 		if err != nil {
 			log.Fatalf("Error while creating directories: %v", err)
 		}
-		err = filepath.WalkDir(folder, walkFunc)
+
+		err = filepath.WalkDir(folder.Source, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+
+			filename := entry.Name()
+			ext := filepath.Ext(filename)
+			if !def.ALLOWED_EXTENSIONS[strings.ToLower(ext)] {
+				return nil
+			}
+
+			rel, err := filepath.Rel(folder.Source, path)
+			if err != nil {
+				return err
+			}
+			outputFile := filepath.Join(destRoot, strings.TrimSuffix(rel, ext)+".mp3")
+
+			// check if file already exists by seeing if a stat succeeds
+			if _, err := os.Stat(outputFile); err == nil {
+				return nil
+			}
+
+			stream, err := getAudioStream(path)
+			if err != nil {
+				log.Fatalf("Cannot get audio stream from file: %v", err)
+			}
+
+			args := []string{
+				// "-hide_banner",
+				// "-loglevel", "error",
+				"-i", path,
+				"-vn",
+				"-map", fmt.Sprintf("0:%d", stream),
+				"-c:a", "libmp3lame",
+				"-q:a", "0",
+				"-f", "mp3",
+				outputFile,
+			}
+
+			cmd := exec.Command("ffmpeg", args...)
+
+			cmd.Stdout = os.Stderr
+			cmd.Stderr = os.Stderr
+
+			if err := cmd.Run(); err != nil {
+				if err := os.Remove(outputFile); err != nil {
+					log.Default().Printf("Cannot delete failed file %s\n", outputFile)
+				}
+				return fmt.Errorf("Transcode for %s failed: %v", path, err)
+			}
+
+			return nil
+		})
 		if err != nil {
 			log.Fatalf("Error while transcoding files: %v", err)
 		}
@@ -127,6 +123,7 @@ func getAudioStream(path string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("Error opening test file: %v", err)
 	}
+	defer fileReader.Close()
 
 	data, err := ffprobe.ProbeReader(ctx, fileReader)
 	if err != nil {
